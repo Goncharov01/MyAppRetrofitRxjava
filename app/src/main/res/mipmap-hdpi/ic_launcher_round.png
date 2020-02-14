@@ -1,0 +1,144 @@
+/**
+ * Copyright 2016 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in
+ * compliance with the License. You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is
+ * distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
+ * the License for the specific language governing permissions and limitations under the License.
+ */
+package io.reactivex.observers;
+
+import java.util.concurrent.atomic.AtomicReference;
+
+import io.reactivex.*;
+import io.reactivex.disposables.Disposable;
+import io.reactivex.functions.Consumer;
+import io.reactivex.internal.disposables.DisposableHelper;
+import io.reactivex.internal.fuseable.QueueDisposable;
+import io.reactivex.internal.util.*;
+
+/**
+ * An Observer that records events and allows making assertions about them.
+ *
+ * <p>You can override the onSubscribe, onNext, onError, onComplete, onSuccess and
+ * cancel methods but not the others (this is by design).
+ *
+ * <p>The TestObserver implements Disposable for convenience where dispose calls cancel.
+ *
+ * @param <T> the value type
+ */
+public class TestObserver<T>
+extends BaseTestConsumer<T, TestObserver<T>>
+implements Observer<T>, Disposable, MaybeObserver<T>, SingleObserver<T>, CompletableObserver {
+    /** The actual observer to forward events to. */
+    private final Observer<? super T> actual;
+
+    /** Holds the current subscription if any. */
+    private final AtomicReference<Disposable> subscription = new AtomicReference<Disposable>();
+
+    private QueueDisposable<T> qs;
+
+    /**
+     * Constructs a non-forwarding TestObserver.
+     * @param <T> the value type received
+     * @return the new TestObserver instance
+     */
+    public static <T> TestObserver<T> create() {
+        return new TestObserver<T>();
+    }
+
+    /**
+     * Constructs a forwarding TestObserver.
+     * @param <T> the value type received
+     * @param delegate the actual Observer to forward events to
+     * @return the new TestObserver instance
+     */
+    public static <T> TestObserver<T> create(Observer<? super T> delegate) {
+        return new TestObserver<T>(delegate);
+    }
+
+    /**
+     * Constructs a non-forwarding TestObserver.
+     */
+    public TestObserver() {
+        this(EmptyObserver.INSTANCE);
+    }
+
+    /**
+     * Constructs a forwarding TestObserver.
+     * @param actual the actual Observer to forward events to
+     */
+    public TestObserver(Observer<? super T> actual) {
+        this.actual = actual;
+    }
+
+    @SuppressWarnings("unchecked")
+    @Override
+    public void onSubscribe(Disposable s) {
+        lastThread = Thread.currentThread();
+
+        if (s == null) {
+            errors.add(new NullPointerException("onSubscribe received a null Subscription"));
+            return;
+        }
+        if (!subscription.compareAndSet(null, s)) {
+            s.dispose();
+            if (subscription.get() != DisposableHelper.DISPOSED) {
+                errors.add(new IllegalStateException("onSubscribe received multiple subscriptions: " + s));
+            }
+            return;
+        }
+
+        if (initialFusionMode != 0) {
+            if (s instanceof QueueDisposable) {
+                qs = (QueueDisposable<T>)s;
+
+                int m = qs.requestFusion(initialFusionMode);
+                establishedFusionMode = m;
+
+                if (m == QueueDisposable.SYNC) {
+                    checkSubscriptionOnce = true;
+                    lastThread = Thread.currentThread();
+                    try {
+                        T t;
+                        while ((t = qs.poll()) != null) {
+                            values.add(t);
+                        }
+                        completions++;
+
+                        subscription.lazySet(DisposableHelper.DISPOSED);
+                    } catch (Throwable ex) {
+                        // Exceptions.throwIfFatal(e); TODO add fatal exceptions?
+                        errors.add(ex);
+                    }
+                    return;
+                }
+            }
+        }
+
+        actual.onSubscribe(s);
+    }
+
+    @Override
+    public void onNext(T t) {
+        if (!checkSubscriptionOnce) {
+            checkSubscriptionOnce = true;
+            if (subscription.get() == null) {
+                errors.add(new IllegalStateException("onSubscribe not called in proper order"));
+            }
+        }
+
+        lastThread = Thread.currentThread();
+
+        if (establishedFusionMode == QueueDisposable.ASYNC) {
+            try {
+                while ((t = qs.poll()) != null) {
+                    values.add(t);
+                }
+            } catch (Throwable ex) {
+                // Exceptions.throwIfFatal(e); TODO add fatal exceptions?
+                errors.add(ex
